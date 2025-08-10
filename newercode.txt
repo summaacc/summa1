@@ -38,7 +38,7 @@ essential_packages = [
     "timm>=0.9.0", "transformers>=4.30.0", "segmentation-models-pytorch",
     "higher", "kornia>=0.7.0", "albumentations>=1.3.0", "opencv-python-headless>=4.8.0",
     "rich>=13.0.0", "plotly>=5.15.0", "umap-learn[plot]>=0.5.0", "einops>=0.7.0",
-    "psutil>=5.9.0", "seaborn>=0.12.0", "scikit-learn>=1.3.0", "Pillow>=10.0.0",
+    "psutil>=5.9.0", "seaborn>=0.12.0", "scikit-learn>=1.3.0,<1.6.0", "Pillow>=10.0.0",
     "matplotlib>=3.7.0", "tqdm>=4.65.0", "pandas>=2.0.0", "torchinfo>=1.8.0",
     "prettytable>=3.8.0", "shap>=0.42.0", "ultralytics>=8.0.0",
     "torchmetrics>=1.0.0", "tensorboard>=2.13.0", "ipywidgets>=8.0.0"
@@ -162,12 +162,12 @@ def set_seed_and_optimize_gpu(seed=42):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
+
     # Optimizations for speed
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
     torch.set_float32_matmul_precision('high')
-    
+
     print(f"🎯 Seed set to {seed} and GPU optimizations enabled.")
 
 set_seed_and_optimize_gpu(42)
@@ -298,18 +298,18 @@ def parse_voc_xml(xml_path: Path) -> torch.Tensor:
         ymin = int(bndbox.find('ymin').text)
         xmax = int(bndbox.find('xmax').text)
         ymax = int(bndbox.find('ymax').text)
-        
+
         # Convert to normalized xywh
         x_center = (xmin + xmax) / 2 / width
         y_center = (ymin + ymax) / 2 / height
         box_width = (xmax - xmin) / width
         box_height = (ymax - ymin) / height
-        
+
         boxes.append([label, x_center, y_center, box_width, box_height])
-        
+
     return torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 5))
 
-def load_json_mask(json_path: Path, shape=(1080, 1920)) -> torch.Tensor:
+def load_json_mask(json_path: Path, shape: Tuple[int, int]) -> torch.Tensor:
     """Loads a segmentation mask from the IDDAW JSON format."""
     mask = np.zeros(shape, dtype=np.uint8)
     with open(json_path, 'r') as f:
@@ -348,7 +348,7 @@ class ComprehensiveADASDataset(Dataset):
             A.RandomBrightnessContrast(p=0.3),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
-        ])
+        ], is_check_shapes=False) # Disable shape check as we handle it robustly
         print(f"🎉 Dataset ready with {len(self.samples):,} samples.")
 
     def _build_index(self):
@@ -368,16 +368,16 @@ class ComprehensiveADASDataset(Dataset):
         samples = []
         train_path = path / 'train'
         if not train_path.exists(): return []
-        
+
         weather_dirs = [p for p in train_path.iterdir() if p.is_dir() and p.name.upper() in self.weather_labels]
         for weather_dir in weather_dirs:
             weather_name = weather_dir.name.upper()
             rgb_base = weather_dir / 'rgb'
             if not rgb_base.exists(): continue
-            
+
             nir_base = weather_dir / 'nir'
             mask_base = weather_dir / 'gtSeg'
-            
+
             for rgb_path in tqdm(list(rgb_base.rglob('*.png')), desc=f"Scanning {weather_name}"):
                 sample = {
                     'image_path': rgb_path, 'weather_name': weather_name, 'dataset': 'iddaw',
@@ -385,7 +385,7 @@ class ComprehensiveADASDataset(Dataset):
                 }
                 nir_path = nir_base / rgb_path.relative_to(rgb_base).with_name(rgb_path.name.replace('_rgb.png', '_nir.png'))
                 if nir_path.exists(): sample['nir_path'] = nir_path
-                
+
                 mask_path = mask_base / rgb_path.relative_to(rgb_base).with_name(rgb_path.name.replace('_rgb.png', '_mask.json'))
                 if mask_path.exists(): sample['mask_path'] = mask_path
                 samples.append(sample)
@@ -396,7 +396,7 @@ class ComprehensiveADASDataset(Dataset):
         image_dir = path / 'image_archive'
         mask_dir = path / 'mask_archive'
         if not image_dir.exists(): return []
-        
+
         for img_path in tqdm(list(image_dir.rglob('*.png')), desc="Scanning New_IDD"):
             mask_path = mask_dir / f"Mask_{img_path.stem.split('_')[1]}.png"
             samples.append({
@@ -440,29 +440,36 @@ class ComprehensiveADASDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        FIXED: Added a try-except block to handle potential errors with corrupted
-        or missing files, preventing the DataLoader from crashing.
+        REFACTORED: Logic updated to prevent albumentations errors by ensuring
+        image and mask have the same dimensions *before* transformation.
         """
         sample_info = self.samples[idx]
         try:
             image = np.array(Image.open(sample_info['image_path']).convert("RGB"))
-            
-            mask = np.zeros((self.input_size[0], self.input_size[1]), dtype=np.float32)
+            h, w, _ = image.shape
+
+            mask = None
             if sample_info.get('mask_path'):
                 p = Path(sample_info['mask_path'])
                 if p.suffix == '.json':
-                    json_mask = load_json_mask(p).numpy()
-                    mask = cv2.resize(json_mask, self.input_size, interpolation=cv2.INTER_NEAREST)
-                else: # .png
-                    png_mask = np.array(Image.open(p))
-                    mask = cv2.resize(png_mask, self.input_size, interpolation=cv2.INTER_NEAREST)
+                    # Pass the actual image shape to the mask loader
+                    mask = load_json_mask(p, shape=(h, w)).numpy()
+                elif p.suffix == '.png':
+                    mask = np.array(Image.open(p))
 
+            # If no mask was loaded, create a blank one matching the image size.
+            if mask is None:
+                mask = np.zeros((h, w), dtype=np.uint8)
+
+            # Now, image and mask are guaranteed to have the same H/W dimensions.
+            # The A.Resize in the transform pipeline will handle resizing them together.
             transformed = self.transform(image=image, mask=mask)
             image_tensor = transformed['image']
             mask_tensor = transformed['mask'].long().unsqueeze(0)
 
             nir_tensor = torch.zeros((1, self.input_size[0], self.input_size[1]))
             if sample_info.get('nir_path'):
+                # Resize NIR separately as it's not part of the main augmentation pipeline
                 nir_img = Image.open(sample_info['nir_path']).convert("L").resize(self.input_size)
                 nir_tensor = T.ToTensor()(nir_img)
 
@@ -477,6 +484,7 @@ class ComprehensiveADASDataset(Dataset):
                 'metadata': { 'image_path': str(sample_info['image_path']), 'dataset': sample_info['dataset'] }
             }
         except Exception as e:
+            # This will catch file read errors or other unexpected issues.
             print(f"⚠️ Warning: Skipping corrupted sample {sample_info['image_path']}. Error: {e}")
             return None
 
@@ -526,21 +534,21 @@ def visualize_sample_batch(loader, weather_names):
              return
 
         images, masks, boxes, weathers = batch['image'], batch['mask'], batch['boxes'], batch['weather']
-        
+
         fig, axes = plt.subplots(2, 4, figsize=(24, 12))
         fig.suptitle("Sample Batch Verification (Image | Mask | BBoxes)", fontsize=16)
-        
+
         for i in range(min(len(images), 8)):
             ax = axes.flat[i]
             img = images[i].permute(1, 2, 0).cpu().numpy()
             mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
             img = np.clip(std * img + mean, 0, 1)
-            
+
             ax.imshow(img)
             cmap = plt.get_cmap('jet')
             mask_overlay = masks[i].squeeze().cpu().numpy()
             ax.imshow(np.ma.masked_where(mask_overlay == 0, mask_overlay), cmap=cmap, alpha=0.4)
-            
+
             for box in boxes[i]:
                 # Convert xywh back to xyxy for visualization
                 _, x_c, y_c, w, h = box
@@ -550,10 +558,10 @@ def visualize_sample_batch(loader, weather_names):
                 height = h * img.shape[0]
                 rect = patches.Rectangle((xmin, ymin), width, height, linewidth=2, edgecolor='r', facecolor='none')
                 ax.add_patch(rect)
-            
+
             ax.axis('off')
             ax.set_title(f"{weather_names[weathers[i].item()]} ({batch['metadata'][i]['dataset']})")
-        
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(VISUALIZATION_DIR / "sample_batch_verification.png", dpi=300)
         plt.show()
@@ -592,45 +600,60 @@ from ultralytics.nn.modules import C2f, Concat, Detect
 
 class WeatherAdaptiveBackbone(nn.Module):
     """
-    MobileViT backbone with multi-modal fusion for weather adaptation.
+    REBUILT: MobileViT backbone with a robust multi-modal fusion strategy.
+    This version uses parallel encoders to ensure NIR features match RGB feature
+    channels at each fusion stage, preventing the channel mismatch runtime error.
     """
     def __init__(self, model_name='mobilevit_s', pretrained=True, use_nir=True):
         super().__init__()
         self.use_nir = use_nir
-        # FIXED: Store model_name directly to avoid AttributeError
         self.model_name = model_name
-        
+
         self.rgb_backbone = timm.create_model(
-            self.model_name, pretrained=pretrained, features_only=True, out_indices=[1, 2, 3, 4]
+            model_name, pretrained=pretrained, features_only=True, out_indices=[1, 2, 3, 4]
         )
         self.feature_info = self.rgb_backbone.feature_info
-        
+        rgb_channels = self.feature_info.channels()
+
         if use_nir:
-            self.nir_encoder = nn.Sequential(
-                nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(16), nn.ReLU(inplace=True),
-                nn.Conv2d(16, self.feature_info.channels()[0], kernel_size=3, stride=2, padding=1),
-            )
+            # Create a parallel encoder for NIR for each feature level.
+            # This ensures the channel dimensions will match correctly for fusion.
+            self.nir_encoders = nn.ModuleList()
+            for i, out_ch in enumerate(rgb_channels):
+                in_ch = 1 if i == 0 else rgb_channels[i-1]
+                self.nir_encoders.append(nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(out_ch),
+                    nn.ReLU(inplace=True)
+                ))
+
+            # Fusion convolutions now correctly take the doubled channel count.
             self.fusion_convs = nn.ModuleList([
-                nn.Conv2d(in_c * 2, in_c, 1) for in_c in self.feature_info.channels()
+                nn.Conv2d(in_c * 2, in_c, kernel_size=1, bias=False) for in_c in rgb_channels
             ])
 
     def forward(self, rgb, nir=None):
         rgb_features = self.rgb_backbone(rgb)
-        
+
         if self.use_nir and nir is not None:
             fused_features = []
-            nir_feat = self.nir_encoder(nir)
+            nir_input = nir
             for i, rgb_feat in enumerate(rgb_features):
-                if nir_feat.shape[-2:] != rgb_feat.shape[-2:]:
-                    nir_feat_resized = F.interpolate(nir_feat, size=rgb_feat.shape[-2:], mode='bilinear', align_corners=False)
-                else:
-                    nir_feat_resized = nir_feat
-                
-                combined = torch.cat([rgb_feat, nir_feat_resized], dim=1)
+                # Spatially resize the NIR input to match the current RGB feature map.
+                nir_resized = F.interpolate(nir_input, size=rgb_feat.shape[-2:], mode='bilinear', align_corners=False)
+
+                # Process through the parallel encoder for this level.
+                nir_feat = self.nir_encoders[i](nir_resized)
+
+                # Concatenate along the channel dimension.
+                combined = torch.cat([rgb_feat, nir_feat], dim=1)
+
+                # Fuse the combined features back to the original channel count.
                 fused = self.fusion_convs[i](combined)
                 fused_features.append(fused)
-                nir_feat = fused
+
+                # Use the output of the fusion as input for the next level's NIR encoder.
+                nir_input = fused
             return fused_features
         else:
             return rgb_features
@@ -659,7 +682,7 @@ class UnifiedADASModel(nn.Module):
         super().__init__()
         self.backbone = WeatherAdaptiveBackbone(use_nir=use_nir)
         backbone_channels = self.backbone.feature_info.channels()
-        
+
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.flat = nn.Flatten()
 
@@ -706,7 +729,7 @@ kaggle_monitor.log_operation("Model Definition Start")
 
 unified_model = UnifiedADASModel(
     weather_classes=len(WEATHER_LABELS),
-    seg_classes=21, 
+    seg_classes=21,
     det_classes=1  # Only one generic 'object' class is parsed
 ).to(device)
 
@@ -718,7 +741,7 @@ try:
         dummy_rgb = torch.randn(2, 3, 512, 512).to(device)
         dummy_nir = torch.randn(2, 1, 512, 512).to(device)
         outputs = unified_model(dummy_rgb, dummy_nir)
-    
+
     print("\n✅ Model forward pass successful!")
     for name, out_tensor in outputs.items():
         if isinstance(out_tensor, (list, tuple)):
@@ -774,10 +797,10 @@ class PolicyNetwork(nn.Module):
         x = self.network(state)
         action_mean = self.actor_mean(x)
         state_value = self.critic_value(x)
-        
+
         action_std = torch.exp(self.action_log_std)
         dist = distributions.Normal(action_mean, action_std)
-        
+
         return dist, state_value
 
 class PPOAgent:
@@ -787,12 +810,12 @@ class PPOAgent:
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.policy_old = PolicyNetwork(state_dim, action_dim).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
-        
+
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.k_epochs = k_epochs
         self.mse_loss = nn.MSELoss()
-        
+
         self.memory = []
 
     def store_transition(self, state, action, log_prob, reward, done):
@@ -816,7 +839,7 @@ class PPOAgent:
             if done: discounted_reward = 0
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
-        
+
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
@@ -829,15 +852,15 @@ class PPOAgent:
             dist, state_values = self.policy(old_states)
             log_probs = dist.log_prob(old_actions)
             dist_entropy = dist.entropy()
-            
+
             ratios = torch.exp(log_probs - old_log_probs.detach())
 
             advantages = rewards - state_values.detach()
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            
+
             loss = -torch.min(surr1, surr2) + 0.5 * self.mse_loss(state_values, rewards) - 0.01 * dist_entropy
-            
+
             self.optimizer.zero_grad()
             loss.mean().backward()
             self.optimizer.step()
@@ -864,7 +887,7 @@ class ActiveLearningAgent:
         """Selects hard cases based on model uncertainty and adds them to a queue."""
         probs = F.softmax(batch_outputs['weather_logits'], dim=1)
         entropy_values = entropy(probs.cpu().detach().numpy(), axis=1)
-        
+
         newly_added = 0
         for i, ent in enumerate(entropy_values):
             if ent > self.uncertainty_threshold:
@@ -875,7 +898,7 @@ class ActiveLearningAgent:
                 }
                 self.hard_case_queue.append(sample_info)
                 newly_added += 1
-        
+
         return newly_added
 
     def get_hard_cases(self, n=10):
@@ -892,7 +915,7 @@ class ActiveLearningAgent:
 # ==== MAIN EXECUTION FOR CELL 4 ====
 kaggle_monitor.log_operation("RL & Active Learning Definition")
 
-STATE_DIM = 5 
+STATE_DIM = 5
 ACTION_DIM = 3
 
 ppo_agent = PPOAgent(state_dim=STATE_DIM, action_dim=ACTION_DIM)
@@ -915,8 +938,8 @@ def demonstrate_agents():
     print("\n2. Active Learning Agent:")
     dummy_logits = torch.randn(4, len(WEATHER_LABELS))
     dummy_metadata = [{'image_path': f'/path/to/img_{i}.png', 'dataset': 'demo'} for i in range(4)]
-    dummy_logits[1] = torch.tensor([0.1] * len(WEATHER_LABELS)) 
-    
+    dummy_logits[1] = torch.tensor([0.1] * len(WEATHER_LABELS))
+
     new_cases = active_learning_agent.select_hard_cases({'weather_logits': dummy_logits}, dummy_metadata)
     print(f"   - Identified {new_cases} new hard case(s) from a dummy batch.")
     active_learning_agent.report_status()
@@ -961,7 +984,7 @@ class MultiTaskLoss(nn.Module):
         self.seg_loss = smp_losses.DiceLoss(mode='multiclass', from_logits=True)
         self.det_loss = v8DetectionLoss(det_model)
         self.weather_loss = nn.CrossEntropyLoss()
-        
+
         self.seg_weight = seg_weight
         self.det_weight = det_weight
         self.weather_weight = weather_weight
@@ -971,14 +994,14 @@ class MultiTaskLoss(nn.Module):
         """ 'targets' is the prepared batch dictionary. """
         loss_weather = self.weather_loss(predictions['weather_logits'], targets['weather'])
         loss_seg = self.seg_loss(predictions['segmentation_output'], targets['mask'].squeeze(1))
-        
+
         # The v8DetectionLoss is designed to work with the raw model output and the batch dict
         loss_det, _ = self.det_loss(predictions['detection_output'], targets)
-        
+
         total_loss = (self.weather_weight * loss_weather) + \
                      (self.seg_weight * loss_seg) + \
                      (self.det_weight * loss_det)
-        
+
         return total_loss, {
             'total_loss': total_loss.item(),
             'weather': loss_weather.item(),
@@ -1012,7 +1035,7 @@ class MultiStageTrainer:
             if boxes.numel() > 0:
                 batch_idx = torch.full((boxes.shape[0], 1), i, device=boxes.device)
                 prepared_boxes.append(torch.cat([batch_idx, boxes], dim=1))
-        
+
         # Create a new batch dictionary with the formatted 'bboxes' tensor
         prepared_batch = batch.copy()
         if prepared_boxes:
@@ -1030,15 +1053,15 @@ class MultiStageTrainer:
         self.model.train(is_train)
         loader = self.train_loader if is_train else self.val_loader
         pbar = tqdm(loader, desc=f"Epoch {epoch+1} {'Training' if is_train else 'Validation'}")
-        
+
         epoch_losses = defaultdict(float)
-        
+
         for batch in pbar:
             if batch is None: continue # Skip corrupted batches
 
             images = batch['image'].to(self.device)
             nirs = batch['nir'].to(self.device)
-            
+
             # Prepare a copy of the batch with targets formatted for the loss function
             targets = self._prepare_det_targets(batch)
 
@@ -1046,7 +1069,7 @@ class MultiStageTrainer:
                 with autocast(enabled=self.config['mixed_precision']):
                     preds = self.model(images, nirs)
                     total_loss, loss_breakdown = self.criterion(preds, targets)
-                
+
                 if is_train:
                     self.optimizer.zero_grad()
                     self.scaler.scale(total_loss).backward()
@@ -1058,7 +1081,7 @@ class MultiStageTrainer:
             pbar.set_postfix({'loss': epoch_losses['total_loss'] / (pbar.n + 1)})
 
         if is_train: self.scheduler.step()
-        
+
         avg_losses = {k: v / len(loader) for k, v in epoch_losses.items()}
         return avg_losses
 
@@ -1067,11 +1090,11 @@ class MultiStageTrainer:
         for epoch in range(epochs):
             train_losses = self._run_epoch(epoch, is_train=True)
             val_losses = self._run_epoch(epoch, is_train=False)
-            
+
             self.history['stage1_train_loss'].append(train_losses['total_loss'])
             self.history['stage1_val_loss'].append(val_losses['total_loss'])
             print(f"Epoch {epoch+1}: Train Loss={train_losses['total_loss']:.4f}, Val Loss={val_losses['total_loss']:.4f}")
-            
+
             torch.save(self.model.state_dict(), MODEL_DIR / f"stage1_epoch_{epoch+1}.pth")
         print("--- Stage 1 Complete ---")
 
@@ -1087,25 +1110,25 @@ class MultiStageTrainer:
             for batch in pbar:
                 if batch is None: continue
                 self.optimizer.zero_grad()
-                
+
                 images = batch['image'].to(self.device)
                 nirs = batch['nir'].to(self.device)
                 targets = self._prepare_det_targets(batch)
-                
+
                 with higher.innerloop_ctx(self.model, self.optimizer) as (fmodel, diffopt):
                     for _ in range(inner_steps):
                         preds = fmodel(images, nirs)
                         loss, _ = self.criterion(preds, targets)
                         diffopt.step(loss)
-                    
+
                     query_preds = fmodel(images, nirs)
                     task_loss, _ = self.criterion(query_preds, targets)
-                    
+
                 task_loss.backward()
                 self.optimizer.step()
                 meta_loss += task_loss.item()
                 pbar.set_postfix({'meta_loss': meta_loss / (pbar.n + 1)})
-            
+
             self.history['stage2_meta_loss'].append(meta_loss / len(self.train_loader))
             print(f"Meta-Epoch {meta_epoch+1}: Meta Loss={meta_loss/len(self.train_loader):.4f}")
         print("--- Stage 2 Complete ---")
@@ -1113,20 +1136,20 @@ class MultiStageTrainer:
     def train_stage3_rl(self, rl_episodes=100, max_steps_per_episode=50):
         print("\n--- Starting Stage 3: RL Policy Training ---")
         self.model.eval()
-        
+
         for episode in range(rl_episodes):
             total_reward = 0
             state = np.random.rand(STATE_DIM)
-            
+
             for step in range(max_steps_per_episode):
                 action, log_prob = self.ppo_agent.select_action(state)
-                
+
                 dummy_detection_acc = np.random.random()
                 dummy_weather_conf = np.random.random()
                 reward = self.ppo_agent.get_reward(dummy_detection_acc, dummy_weather_conf, 0.1, 0.1)
                 next_state = np.random.rand(STATE_DIM)
                 done = (step == max_steps_per_episode - 1)
-                
+
                 self.ppo_agent.store_transition(state, torch.from_numpy(action), log_prob, reward, done)
                 state = next_state
                 total_reward += reward
@@ -1134,7 +1157,7 @@ class MultiStageTrainer:
             loss = self.ppo_agent.update()
             self.history['stage3_rl_reward'].append(total_reward)
             self.history['stage3_rl_loss'].append(loss)
-            
+
             if (episode + 1) % 10 == 0:
                 print(f"RL Episode {episode+1}: Total Reward={total_reward:.2f}, Policy Loss={loss:.4f}")
         print("--- Stage 3 Complete ---")
@@ -1184,10 +1207,10 @@ class ComprehensiveEvaluator:
         self.history = trainer_history
         self.device = device
         self.weather_names = weather_names
-        
+
         self.det_metric = MeanAveragePrecision(box_format='xywh')
         self.seg_metric = JaccardIndex(task="multiclass", num_classes=model.segmentation_head.out_channels)
-        
+
         self.weather_preds, self.weather_true = [], []
         self.inference_times = []
 
@@ -1198,7 +1221,7 @@ class ComprehensiveEvaluator:
                 if batch is None: continue
                 images = batch['image'].to(self.device)
                 nirs = batch['nir'].to(self.device)
-                
+
                 start_time = time.time()
                 preds = self.model(images, nirs)
                 self.inference_times.append(time.time() - start_time)
@@ -1207,13 +1230,13 @@ class ComprehensiveEvaluator:
                 self.weather_true.append(batch['weather'].cpu())
 
                 self.seg_metric.update(preds['segmentation_output'].cpu(), batch['mask'].squeeze(1).cpu())
-                
+
                 # Skipping mAP calculation for now due to complexity of formatting preds/targets
                 pass
 
         self.weather_preds = torch.cat(self.weather_preds)
         self.weather_true = torch.cat(self.weather_true)
-        
+
         print("--- Evaluation Complete ---")
         self.report_results()
 
@@ -1221,16 +1244,16 @@ class ComprehensiveEvaluator:
         print("\n--- Evaluation Results ---")
         weather_acc = (self.weather_preds == self.weather_true).float().mean().item()
         print(f"🌦️ Weather Classification Accuracy: {weather_acc:.4f}")
-        
+
         miou = self.seg_metric.compute().item()
         print(f"🛣️ Segmentation mIoU: {miou:.4f}")
-        
+
         print(f"🚗 Detection mAP: [Skipped due to output format complexity]")
-        
+
         avg_inference_ms = np.mean(self.inference_times) * 1000
         fps = 1 / np.mean(self.inference_times)
         print(f"⚡ Average Inference Time: {avg_inference_ms:.2f} ms ({fps:.1f} FPS)")
-        
+
         self.plot_training_history()
         self.plot_confusion_matrix()
         self.visualize_predictions()
@@ -1254,7 +1277,7 @@ class ComprehensiveEvaluator:
         plt.ylabel('Total Reward')
         plt.legend()
         plt.grid(True)
-        
+
         plt.tight_layout()
         plt.savefig(VISUALIZATION_DIR / "training_history.png")
         plt.show()
@@ -1268,38 +1291,38 @@ class ComprehensiveEvaluator:
         plt.ylabel('True Label')
         plt.savefig(VISUALIZATION_DIR / "confusion_matrix.png")
         plt.show()
-        
+
     def visualize_predictions(self, num_samples=8):
         self.model.eval()
         batch = next(iter(self.dataloader))
         while batch is None: batch = next(iter(self.dataloader))
-        
+
         images = batch['image'][:num_samples].to(self.device)
         nirs = batch['nir'][:num_samples].to(self.device)
-        
+
         with torch.no_grad():
             outputs = self.model(images, nirs)
 
         images = images.cpu()
         seg_preds = outputs['segmentation_output'].argmax(dim=1).cpu()
-        
+
         fig, axes = plt.subplots(2, 4, figsize=(24, 12))
         fig.suptitle("Model Predictions (Image with Seg & Det Overlays)", fontsize=16)
-        
+
         for i in range(num_samples):
             ax = axes.flat[i]
             img = images[i].permute(1, 2, 0).numpy()
             mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
             img = np.clip(std * img + mean, 0, 1)
-            
+
             ax.imshow(img)
             ax.imshow(seg_preds[i], cmap='jet', alpha=0.4)
-            
+
             true_weather = self.weather_names[batch['weather'][i].item()]
             pred_weather = self.weather_names[outputs['weather_logits'][i].argmax().item()]
             ax.set_title(f"True: {true_weather}\nPred: {pred_weather}")
             ax.axis('off')
-            
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(VISUALIZATION_DIR / "prediction_examples.png")
         plt.show()
@@ -1307,30 +1330,30 @@ class ComprehensiveEvaluator:
     def visualize_grad_cam(self, num_samples=4):
         print("--- Generating Grad-CAM visualizations ---")
         grad_cam = GradCAM(self.model, target_layer=self.model.backbone.rgb_backbone.layer4)
-        
+
         batch = next(iter(self.dataloader))
         while batch is None: batch = next(iter(self.dataloader))
         images = batch['image'][:num_samples].to(self.device)
-        
+
         def model_output_fn(output):
             return output['weather_logits'].max()
 
         heatmap = grad_cam(images, model_output_fn)
-        
+
         fig, axes = plt.subplots(1, num_samples, figsize=(20, 5))
         for i in range(num_samples):
             ax = axes[i]
             img = images[i].permute(1, 2, 0).cpu().numpy()
             mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
             img = np.clip(std * img + mean, 0, 1)
-            
+
             hmap = heatmap[i].squeeze().cpu().numpy()
             hmap = cv2.resize(hmap, (img.shape[1], img.shape[0]))
-            
+
             ax.imshow(img)
             ax.imshow(hmap, cmap='jet', alpha=0.5)
             ax.axis('off')
-        
+
         plt.tight_layout()
         plt.savefig(VISUALIZATION_DIR / "grad_cam_examples.png")
         plt.show()
